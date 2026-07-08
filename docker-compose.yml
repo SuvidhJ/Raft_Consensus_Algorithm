@@ -1,0 +1,50 @@
+services:
+  node1:
+    build: .
+    restart: unless-stopped
+    environment:
+      - NODE_ID=1
+      - PORT=50051
+      - PEERS=node2:50052,node3:50053
+      - RAFT_ADVERTISE_ADDR=node1:50051
+      - METRICS_PORT=51051
+    ports:
+      - "50051:50051"
+      - "51051:51051"
+    volumes:
+      - node1-data:/app/data
+
+  node2:
+    build: .
+    restart: unless-stopped
+    environment:
+      - NODE_ID=2
+      - PORT=50052
+      - PEERS=node1:50051,node3:50053
+      - RAFT_ADVERTISE_ADDR=node2:50052
+      - METRICS_PORT=51052
+    ports:
+      - "50052:50052"
+      - "51052:51052"
+    volumes:
+      - node2-data:/app/data
+
+  node3:
+    build: .
+    restart: unless-stopped
+    environment:
+      - NODE_ID=3
+      - PORT=50053
+      - PEERS=node1:50051,node2:50052
+      - RAFT_ADVERTISE_ADDR=node3:50053
+      - METRICS_PORT=51053
+    ports:
+      - "50053:50053"
+      - "51053:51053"
+    volumes:
+      - node3-data:/app/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

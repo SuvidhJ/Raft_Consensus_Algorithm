@@ -1,0 +1,64 @@
+syntax = "proto3";
+package proto;
+option go_package = "github.com/SuvidhJ/Raft_Consensus_Algorithm/proto";
+
+service KVService {
+  // Get serves a local (possibly stale) read from any node.
+  rpc Get(GetRequest) returns (GetResponse);
+  // GetLinearizable serves a linearizable read via a leader quorum barrier.
+  rpc GetLinearizable(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSwap(CasRequest) returns (CasResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  string value = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message SetRequest {
+  string key = 1;
+  string value = 2;
+  // Optional client session for exactly-once application across retries.
+  uint64 client_id = 3;
+  uint64 sequence = 4;
+}
+
+message SetResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+  uint64 client_id = 2;
+  uint64 sequence = 3;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  bool existed = 2;
+  string error_message = 3;
+}
+
+message CasRequest {
+  string key = 1;
+  string expected_value = 2; // ignored when expect_absent is set
+  string new_value = 3;
+  bool expect_absent = 4; // succeed only if the key does not exist
+  uint64 client_id = 5;
+  uint64 sequence = 6;
+}
+
+message CasResponse {
+  bool success = 1;       // the operation was committed and applied
+  bool swapped = 2;        // the comparison matched and the write happened
+  string current_value = 3; // value observed when the comparison failed
+  string error_message = 4;
+}

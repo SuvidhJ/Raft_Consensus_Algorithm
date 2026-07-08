@@ -1,0 +1,22 @@
+# Runtime artifacts
+logs/
+data/
+*.log
+
+# Downloaded tooling (scripts/setup-tools.ps1 fetches protoc here)
+tools/
+
+# Build outputs
+*.exe
+*.test
+raft-kv
+/bin/
+
+# Chaos test artifacts
+chaos-seed-*
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
