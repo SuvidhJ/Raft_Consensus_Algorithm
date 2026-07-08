@@ -1,0 +1,7 @@
+# Normalize line endings: LF in the repo, native on checkout where it matters
+* text=auto
+*.go text eol=lf
+*.proto text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf

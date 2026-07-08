@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      - name: Unit and integration tests (race detector)
+        run: go test -race -count=1 ./raft/ ./tests/ -timeout 15m
+
+      - name: Chaos suite, extra seeds (race detector)
+        run: |
+          CHAOS_SEED=7    go test -race -count=1 ./tests/ -run TestChaos -timeout 10m
+          CHAOS_SEED=1337 go test -race -count=1 ./tests/ -run TestChaos -timeout 10m
+
+      - name: Upload chaos artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-artifacts
+          path: logs/chaos-*
+          if-no-files-found: ignore
