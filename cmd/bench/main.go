@@ -106,11 +106,15 @@ func main() {
 					if *linearizable {
 						op = "lin-get"
 						// Linearizable reads only succeed on the leader.
-						target = clients[leaderIdx.Load()%int64(len(clients))]
+						h := leaderIdx.Load()
+						target = clients[h%int64(len(clients))]
 						resp, err := target.GetLinearizable(ctx, &proto.GetRequest{Key: key})
 						ok = err == nil && resp != nil && (resp.Success || resp.ErrorMessage == "Key not found")
 						if !ok {
-							leaderIdx.Add(1)
+							// Only the first worker to see this hint fail
+							// advances it; blind increments from many workers
+							// scatter everyone across followers.
+							leaderIdx.CompareAndSwap(h, h+1)
 						}
 					} else {
 						op = "get"
@@ -121,7 +125,8 @@ func main() {
 				} else {
 					op = "set"
 					seq++
-					target := clients[leaderIdx.Load()%int64(len(clients))]
+					h := leaderIdx.Load()
+					target := clients[h%int64(len(clients))]
 					ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 					resp, err := target.Set(ctx, &proto.SetRequest{
 						Key: key, Value: value, ClientId: clientID, Sequence: seq,
@@ -129,9 +134,9 @@ func main() {
 					cancel()
 					ok = err == nil && resp != nil && resp.Success
 					if !ok {
-						// Rotate the leader hint and let the retry happen as
-						// a new measured operation.
-						leaderIdx.Add(1)
+						// Rotate the leader hint (once per failed hint) and
+						// let the retry happen as a new measured operation.
+						leaderIdx.CompareAndSwap(h, h+1)
 					}
 				}
 

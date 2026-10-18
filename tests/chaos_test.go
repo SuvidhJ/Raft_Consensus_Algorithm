@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,12 @@ type chaosHub struct {
 	dropRate float64
 	dupRate  float64
 	maxDelay time.Duration
+
+	// Fault accounting, reported when a run passes.
+	msgsDropped    uint64 // lost on the request path (noise, partition, or crashed peer)
+	repliesDropped uint64 // processed, but the response was lost
+	msgsDuplicated uint64
+	leadersElected atomic.Uint64 // BecameLeader totals of nodes already stopped
 }
 
 func newChaosHub(seed int64) *chaosHub {
@@ -103,17 +110,26 @@ func (h *chaosHub) plan(from, to string) (target *raft.RaftNode, delay time.Dura
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.down[from] || h.down[to] || h.blocked[pairKey(from, to)] {
+		h.msgsDropped++
 		return nil, 0, true, false, false
 	}
 	target = h.nodes[to]
 	if target == nil {
+		h.msgsDropped++
 		return nil, 0, true, false, false
 	}
 	if h.rng.Float64() < h.dropRate {
+		h.msgsDropped++
 		return nil, 0, true, false, false
 	}
 	dropReply = h.rng.Float64() < h.dropRate
 	dup = h.rng.Float64() < h.dupRate
+	if dropReply {
+		h.repliesDropped++
+	}
+	if dup {
+		h.msgsDuplicated++
+	}
 	if h.maxDelay > 0 {
 		delay = time.Duration(h.rng.Int63n(int64(h.maxDelay)))
 	}
@@ -232,6 +248,7 @@ func startChaosNode(hub *chaosHub, id uint32, addr string, peers []string, dataD
 }
 
 func (cn *chaosNode) stop(hub *chaosHub) {
+	hub.leadersElected.Add(cn.node.Status().BecameLeader)
 	hub.crash(cn.addr)
 	cn.node.Close()
 	close(cn.stopApply)
@@ -291,6 +308,9 @@ func runChaos(t *testing.T, seed int64) {
 	// driven entirely by the seeded RNG.
 	disable := os.Getenv("CHAOS_DISABLE") // comma list: partition,crash,noise
 
+	// Effective fault actions; read only after chaosWG.Wait().
+	var nPartitions, nCrashes, nRestarts, nNoise int
+
 	chaosWG.Add(1)
 	go func() {
 		defer chaosWG.Done()
@@ -320,6 +340,7 @@ func runChaos(t *testing.T, seed int64) {
 				}
 				partitioned = rng.Intn(n)
 				hub.setPartitioned(addrs[partitioned], addrs, true)
+				nPartitions++
 			case 1: // heal partitions
 				if partitioned >= 0 {
 					hub.setPartitioned(addrs[partitioned], addrs, false)
@@ -336,6 +357,7 @@ func runChaos(t *testing.T, seed int64) {
 					nodes[idx] = nil
 					nodesMu.Unlock()
 					crashed = idx
+					nCrashes++
 				}
 			case 3: // restart the crashed node (WAL recovery under load)
 				if crashed >= 0 {
@@ -351,9 +373,11 @@ func runChaos(t *testing.T, seed int64) {
 					nodes[idx] = cn
 					nodesMu.Unlock()
 					crashed = -1
+					nRestarts++
 				}
 			case 4: // packet loss + jitter
 				hub.setNoise(rng.Float64()*0.15, rng.Float64()*0.1, time.Duration(rng.Intn(20))*time.Millisecond)
+				nNoise++
 			case 5: // quiet network
 				hub.setNoise(0, 0, 0)
 			}
@@ -591,9 +615,16 @@ func runChaos(t *testing.T, seed int64) {
 		}
 	}
 	ops := make([]porcupine.Operation, 0, len(history))
+	var nSets, nGets, nPending int
 	for _, r := range history {
 		op := r.op
+		if op.Input.(modelInput).Op == "set" {
+			nSets++
+		} else {
+			nGets++
+		}
 		if r.pending {
+			nPending++
 			// An indeterminate write may take effect at any point after its
 			// call; modeling it as returning after every other operation
 			// lets porcupine linearize it anywhere in that window.
@@ -631,6 +662,16 @@ func runChaos(t *testing.T, seed int64) {
 		t.Fatalf("linearizability check failed: %s (%d ops)", verdict, len(ops))
 	}
 	t.Logf("chaos run passed: %d operations linearizable, state machines identical", len(ops))
+
+	leaders := hub.leadersElected.Load()
+	for _, cn := range live {
+		leaders += cn.node.Status().BecameLeader
+	}
+	hub.mu.Lock()
+	t.Logf("chaos stats: seed=%d ops=%d sets=%d gets=%d pending=%d crashes=%d restarts=%d partitions=%d noise=%d dropped=%d reply_dropped=%d duplicated=%d leaders_elected=%d",
+		seed, len(ops), nSets, nGets, nPending, nCrashes, nRestarts, nPartitions, nNoise,
+		hub.msgsDropped, hub.repliesDropped, hub.msgsDuplicated, leaders)
+	hub.mu.Unlock()
 }
 
 func dumpChaosArtifacts(t *testing.T, seed int64, ops []porcupine.Operation, model porcupine.Model, info porcupine.LinearizationInfo) {

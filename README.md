@@ -37,7 +37,8 @@ faults.
 - Prometheus-format `/metrics`, JSON `/status`, `/healthz` — zero extra
   dependencies
 - `ClusterStatus` admin RPC; CLI for kv ops, status, and membership changes
-- Benchmark tool with throughput and p50/p90/p95/p99 latency
+- Benchmark tool with throughput and p50/p90/p95/p99 latency, plus a
+  multi-process leader-crash failover harness (`cmd/failover`)
 - Docker Compose 3-node cluster; GitHub Actions CI with race detector
 
 **Verification**
@@ -49,8 +50,16 @@ faults.
 - **Chaos suite**: seeded fault injection (partitions, drops on request and
   response paths, duplication, delays, crash/restart with WAL recovery
   under load) with linearizability + state-machine-convergence assertions.
-  It caught three real consensus bugs during development — see
-  [docs/CORRECTNESS.md](docs/CORRECTNESS.md).
+  500 of 500 seeds pass: 118,948 operations verified linearizable across
+  1,426 node crashes, 2,830 partitions and ~195k dropped messages. It caught
+  three real consensus bugs during development.
+- **Failover benchmark** (`cmd/failover`): hard-kills the leader process of
+  a real 3-process cluster under load, restarts it from its WAL, and checks
+  every key on every replica after each crash. It caught five more bugs the
+  chaos suite could not see, including a State Machine Safety violation;
+  after the fixes, 200 crashes lost 0 of 177,568 acknowledged writes.
+  Bugs and fixes: [docs/CORRECTNESS.md](docs/CORRECTNESS.md); methodology
+  and raw numbers: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Architecture
 
@@ -108,6 +117,9 @@ go run ./cmd/client -op remove-server -peer 127.0.0.1:50054
 go test ./raft/ ./tests/            # full suite (~30s)
 go test ./tests/ -run TestChaos -v  # chaos suite only
 CHAOS_SEED=7 go test ./tests/ -run TestChaos   # reproduce a fault pattern
+
+# leader-crash failover benchmark against real node processes
+go build -o raftkv.exe . ; go run ./cmd/failover -bin ./raftkv.exe -trials 200
 ```
 
 On chaos failures, the raw history and an interactive porcupine
@@ -120,16 +132,17 @@ go run ./cmd/bench -addrs 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 `
     -concurrency 8 -duration 30s -read-ratio 0.5 [-linearizable]
 ```
 
-Reference numbers from a 3-node cluster on one laptop-class Windows machine
-(every write individually fsynced on leader and followers):
+Measured on a 3-process cluster on one Windows laptop (i7-13650HX, NVMe;
+every write fsynced on a quorum before it is acknowledged). Medians of
+repeated runs; methodology, ranges and raw numbers are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-| Operation | Throughput | p50 | p99 |
-|-----------|-----------:|----:|----:|
-| `set` (durable, replicated) | ~670/s | 10.9 ms | 26 ms |
-| `get` (local read) | ~676/s* | <1 ms | 1.5 ms |
-| `lin-get` (ReadIndex barrier) | ~1,245/s | 3.3 ms | 10.7 ms |
-
-\* mixed 50/50 workload; local reads are not the bottleneck.
+| Measurement | Result |
+|---|---|
+| Leader crash → writes resume (200 hard kills) | p50 **353 ms**, p99 **514 ms**; 0 of 177,568 acknowledged writes lost |
+| Linearizable reads (ReadIndex, 128 clients) | **~61k/s**, p50 1.8 ms |
+| Durable writes | 314/s at p50 3.2 ms (1 client); ~470/s (16 clients) |
+| Local reads (64 clients) | ~101k/s, p50 < 1 ms |
 
 ## Configuration
 

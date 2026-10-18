@@ -109,6 +109,57 @@ acked any commit reaching its index, even if leadership had changed and a
 *different* entry from a newer term committed there. The commit wait now
 verifies the term at the index.
 
+## Bugs the failover benchmark caught
+
+`cmd/failover` hard-kills the leader *process* of a real 3-process gRPC
+cluster under sessioned write load, restarts it from its WAL, and verifies
+every key on every replica after each crash. Its runs exposed five defects
+that the chaos suite had missed, each now pinned by a deterministic
+regression test (`tests/failover_regression_test.go`, `raft/raft_test.go`):
+
+1. **Followers committed a stale log suffix (State Machine Safety).**
+   `HandleAppendEntries` advanced `commitIndex` to
+   `min(leaderCommit, lastLogIndex)` instead of the index of the last entry
+   the request verified (Figure 2). A restarted ex-leader whose log still
+   held uncommitted entries from its old term received a matching batch
+   that ended *before* those entries, and committed and applied them: the
+   benchmark caught a replica applying `w2-44` at index 6378 while the
+   cluster had committed the new leader's no-op there. The replica then
+   refused the leader's overwrite ("conflict at a committed index") and
+   never caught up.
+2. **Backtracking snapped to the snapshot boundary.**
+   `findLastIndexOfTermLocked` returned the snapshot index whenever the
+   conflict term equalled the snapshot's term, even if later log entries
+   shared that term. It rewound `nextIndex` to the snapshot, which produced
+   exactly the batch that triggered bug 1, forever.
+3. **Elections waited for dead peers.** Pre-vote and vote rounds counted
+   ballots only after *every* peer replied. A connect to a dead host does
+   not fail fast, so each round stalled for the RPC timeouts (300 ms + 350
+   ms). Rounds now decide as soon as a majority grants or refuses.
+4. **Stale pre-votes deposed fresh leaders.** While one survivor's slow
+   pre-vote was in flight it voted another survivor into office; the
+   pre-vote then succeeded and it campaigned anyway, deposing the leader
+   just elected. A candidate now abandons a pre-vote if its term changed or
+   it heard from a leader while the pre-vote was running.
+5. **Leader no-ops overtook queued entries, and a snapshot lost them
+   (acknowledged write lost on a replica).** The apply loop consumes no-op
+   and config entries itself and marked them applied at once, even while
+   earlier entries still sat in the apply channel. When that jump crossed
+   the snapshot threshold, the node snapshotted state *missing* those
+   entries, compacted them, and `ShouldApplyEntry` then dropped them. The
+   benchmark caught a restarted replica serving a key's previous value
+   (`9431` instead of the acknowledged `9943`), and the bad snapshot later
+   spread to another node through `InstallSnapshot`. The same early jump
+   could also satisfy a linearizable read barrier too soon. A no-op or
+   config entry now counts as applied only after every earlier entry has.
+
+Why the chaos suite missed them: its in-memory hub drops messages
+*instantly*, so no RPC ever hangs (bugs 3–4). Its clients also overwrite a
+single key and retry each write until it commits, so a stale entry applied
+early has the same effect as its retry, and a dropped entry is masked by
+the next overwrite (bugs 1 and 5). The failover benchmark instead writes
+2,048 distinct keys and checks each against its last acknowledged value.
+
 ## Hardening from the line-by-line audit
 
 A subsequent full-code audit found and fixed these additional defects:
@@ -137,9 +188,15 @@ A subsequent full-code audit found and fixed these additional defects:
 Stated plainly, because honesty is part of correctness:
 
 - **Windows clock granularity.** Go's monotonic clock on Windows ticks
-  coarsely (~0.5–15.6 ms). All correctness-critical comparisons use
-  conservative directions, but sub-tick timing in tests can be flaky on
-  Windows; CI runs on Linux.
+  coarsely (~0.3–15.6 ms). Correctness-critical comparisons use
+  conservative directions with one known exception: the ReadIndex
+  freshness check (`quorumSinceLocked`) accepts peer contact stamped in the
+  *same* tick as the read began, so a heartbeat sent up to one tick before
+  the read can count as post-read evidence. Exploiting that sub-tick window
+  would also need a rival election that bypasses pre-vote; on Linux the
+  clock is nanosecond-grained. Sub-tick timing in tests can be flaky on
+  Windows (e.g. `TestReplicationUsesSingleInFlightPerPeer`, whose 180 ms
+  mock follower can trip check-quorum); CI runs on Linux.
 - **No TLS or authentication** on gRPC or the metrics endpoint.
 - **Membership identity is the advertised address**; changing a node's
   address requires remove + re-add.

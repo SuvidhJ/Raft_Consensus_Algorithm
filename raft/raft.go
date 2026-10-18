@@ -599,8 +599,15 @@ func (rn *RaftNode) applyLoop() {
 		rn.mu.Unlock()
 
 		// Leader no-ops and configuration entries are consumed by Raft
-		// itself and never reach the state machine.
+		// itself and never reach the state machine. They count as applied
+		// only once every earlier entry has been: NotifyApplied can snapshot
+		// the state machine, and running ahead of entries still queued on
+		// applyCh would capture state missing them, compact them away, and
+		// make ShouldApplyEntry drop them.
 		if entry.Command == "INIT" || entry.Type == proto.EntryType_ENTRY_CONFIG {
+			if !rn.waitApplied(next - 1) {
+				return
+			}
 			rn.NotifyApplied(next)
 			continue
 		}
@@ -626,6 +633,24 @@ func (rn *RaftNode) applyLoop() {
 	}
 }
 
+// waitApplied blocks until the state machine has applied through index,
+// returning false if the node stops first.
+func (rn *RaftNode) waitApplied(index uint64) bool {
+	rn.mu.Lock()
+	for rn.lastApplied < index {
+		progress := rn.progressCh
+		rn.mu.Unlock()
+		select {
+		case <-rn.stopped:
+			return false
+		case <-progress:
+		}
+		rn.mu.Lock()
+	}
+	rn.mu.Unlock()
+	return true
+}
+
 func (rn *RaftNode) startElection() {
 	rn.startElectionInternal(false)
 }
@@ -646,17 +671,29 @@ func (rn *RaftNode) startElectionInternal(skipPreVote bool) {
 	}
 	rn.mu.Unlock()
 
+	var preVoteTerm uint64
+	var preVoteStart time.Time
 	if rn.enablePreVote && !skipPreVote {
-		if !rn.runPreVote() {
+		granted, term, started := rn.runPreVote()
+		if !granted {
 			rn.mu.Lock()
 			rn.resetElectionDeadlineLocked()
 			rn.mu.Unlock()
 			return
 		}
+		preVoteTerm, preVoteStart = term, started
 	}
 
 	rn.mu.Lock()
 	if rn.state == Leader {
+		rn.mu.Unlock()
+		return
+	}
+	if preVoteTerm != 0 && (rn.currentTerm+1 != preVoteTerm || rn.lastLeaderContact.After(preVoteStart)) {
+		// The pre-vote went stale while replies were in flight: we voted in
+		// another candidate's election or heard from a leader. Campaigning
+		// now would depose a leader the cluster has just elected.
+		rn.resetElectionDeadlineLocked()
 		rn.mu.Unlock()
 		return
 	}
@@ -675,16 +712,14 @@ func (rn *RaftNode) startElectionInternal(skipPreVote bool) {
 	rn.ctrElectionsStarted.Add(1)
 	log.Printf("[Node %d] starting election for term %d", rn.id, term)
 
-	votes := 1
 	majority := (len(peers)+1)/2 + 1
-	var wg sync.WaitGroup
-	var voteMu sync.Mutex
+	results := make(chan bool, len(peers))
 
 	for _, peer := range peers {
 		peer := peer
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			granted := false
+			defer func() { results <- granted }()
 			ctx, cancel := rn.newRPCTimeoutContext(350 * time.Millisecond)
 			defer cancel()
 
@@ -711,15 +746,11 @@ func (rn *RaftNode) startElectionInternal(skipPreVote bool) {
 			}
 			rn.mu.Unlock()
 
-			if resp.VoteGranted {
-				voteMu.Lock()
-				votes++
-				voteMu.Unlock()
-			}
+			granted = resp.VoteGranted
 		}()
 	}
 
-	wg.Wait()
+	votes := awaitVotes(results, len(peers), majority)
 
 	rn.mu.Lock()
 	won := rn.state == Candidate && rn.currentTerm == term && votes >= majority
@@ -735,28 +766,30 @@ func (rn *RaftNode) startElectionInternal(skipPreVote bool) {
 	}
 }
 
-func (rn *RaftNode) runPreVote() bool {
+// runPreVote asks peers whether they would vote for us in the next term. It
+// returns that term and when the round started, so the caller can discard a
+// result that went stale before it campaigns.
+func (rn *RaftNode) runPreVote() (bool, uint64, time.Time) {
 	rn.mu.Lock()
 	if rn.state == Leader {
 		rn.mu.Unlock()
-		return false
+		return false, 0, time.Time{}
 	}
+	started := time.Now()
 	term := rn.currentTerm + 1
 	lastLogIndex := rn.lastLogIndexLocked()
 	lastLogTerm := rn.lastLogTermLocked()
 	peers := append([]string(nil), rn.peers...)
 	rn.mu.Unlock()
 
-	votes := 1
 	majority := (len(peers)+1)/2 + 1
-	var wg sync.WaitGroup
-	var voteMu sync.Mutex
+	results := make(chan bool, len(peers))
 
 	for _, peer := range peers {
 		peer := peer
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			granted := false
+			defer func() { results <- granted }()
 			ctx, cancel := rn.newRPCTimeoutContext(300 * time.Millisecond)
 			defer cancel()
 			resp, err := rn.transport.PreVote(ctx, peer, &proto.PreVoteRequest{
@@ -782,16 +815,28 @@ func (rn *RaftNode) runPreVote() bool {
 			}
 			rn.mu.Unlock()
 
-			if resp.VoteGranted {
-				voteMu.Lock()
-				votes++
-				voteMu.Unlock()
-			}
+			granted = resp.VoteGranted
 		}()
 	}
 
-	wg.Wait()
-	return votes >= majority
+	return awaitVotes(results, len(peers), majority) >= majority, term, started
+}
+
+// awaitVotes counts our own vote plus replies from peers, returning as soon
+// as the outcome is decided: a majority granted, or too few replies remain
+// to reach one. Waiting for every reply would stall each election round on
+// a crashed or partitioned peer, whose RPC can hang until its deadline (a
+// connect to a dead host does not fail fast). Late replies are harmless:
+// their goroutines act only under rn.mu after re-checking term and state,
+// and results is buffered so they never block.
+func awaitVotes(results <-chan bool, peers, majority int) int {
+	votes := 1
+	for pending := peers; votes < majority && votes+pending >= majority; pending-- {
+		if <-results {
+			votes++
+		}
+	}
+	return votes
 }
 
 func (rn *RaftNode) becomeFollowerLocked(term uint64, leaderID uint32) {
@@ -1613,9 +1658,14 @@ func (rn *RaftNode) HandleAppendEntries(req *proto.AppendEntriesRequest) *proto.
 		rn.recomputeConfigLocked()
 	}
 
+	// Commit only up to the last entry this request verified against the
+	// leader's log (Figure 2: "index of last new entry"), never to our own
+	// last index: beyond the verified prefix our log can still hold a stale
+	// suffix from an older term, such as a deposed leader's uncommitted
+	// writes, which the leader has not yet overwritten.
 	commitAdvanced := false
-	if req.LeaderCommit > rn.commitIndex {
-		rn.commitIndex = minUint64(req.LeaderCommit, rn.lastLogIndexLocked())
+	if newCommit := minUint64(req.LeaderCommit, req.PrevLogIndex+uint64(len(req.Entries))); newCommit > rn.commitIndex {
+		rn.commitIndex = newCommit
 		commitAdvanced = true
 		rn.broadcastProgressLocked()
 	}
@@ -1888,13 +1938,16 @@ func (rn *RaftNode) firstIndexOfTermLocked(term uint64) uint64 {
 }
 
 func (rn *RaftNode) findLastIndexOfTermLocked(term uint64) uint64 {
-	if term == rn.lastIncludedTerm {
-		return rn.lastIncludedIndex
-	}
+	// Search the log before the snapshot boundary: entries after the
+	// snapshot can share its term, and stopping at the boundary would
+	// rewind a follower's nextIndex to the snapshot.
 	for i := len(rn.log) - 1; i >= 0; i-- {
 		if rn.log[i].Term == term {
 			return rn.log[i].Index
 		}
+	}
+	if term == rn.lastIncludedTerm {
+		return rn.lastIncludedIndex
 	}
 	return 0
 }
